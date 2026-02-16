@@ -3,7 +3,7 @@ import * as dotenv from 'dotenv';
 import * as path from 'path';
 
 dotenv.config({
-  path: path.resolve(__dirname, '../.env')
+	path: path.resolve(__dirname, '../.env')
 });
 
 import { generatePracticeQuestion } from './services/aiService';
@@ -21,8 +21,16 @@ export function activate(context: vscode.ExtensionContext) {
 			return;
 		}
 
-		const fileName = editor.document.fileName;
 		const languageId = editor.document.languageId;
+		const fileContent = editor.document.getText();
+
+		// 🚫 Prevent multiple question generation
+		if (fileContent.includes('// Question:')) {
+			vscode.window.showInformationMessage('A practice question is already generated in this file.');
+			return;
+		}
+
+		const fileName = editor.document.fileName;
 		const baseName = fileName.split('/').pop()?.toLowerCase() || '';
 
 		let detectedTopic = 'General Programming';
@@ -35,7 +43,6 @@ export function activate(context: vscode.ExtensionContext) {
 			detectedTopic = 'Linked List';
 		}
 
-		// Step 1: Show detected topic clearly
 		const decision = await vscode.window.showInformationMessage(
 			`Detected Topic: ${detectedTopic}`,
 			{ modal: true },
@@ -43,11 +50,8 @@ export function activate(context: vscode.ExtensionContext) {
 			'Change Topic'
 		);
 
-		if (!decision) {
-			return;
-		}
+		if (!decision) return;
 
-		// Step 2: If user wants to change topic
 		if (decision === 'Change Topic') {
 			const manualTopic = await vscode.window.showInputBox({
 				prompt: 'Enter topic name manually'
@@ -60,60 +64,37 @@ export function activate(context: vscode.ExtensionContext) {
 
 		vscode.window.showInformationMessage('Generating practice question...');
 
-		const question = await generatePracticeQuestion(detectedTopic, languageId);
+		let question: string;
 
+		try {
+			question = await generatePracticeQuestion(detectedTopic, languageId);
+		} catch (error) {
+			console.error(error);
+			vscode.window.showErrorMessage('AI generation failed.');
+			return;
+		}
+
+		// Determine correct comment prefix
 		const commentPrefix = languageId === 'python' ? '# ' : '// ';
 
-		const formattedQuestion = question
-			.split('\n')
-			.map(line => commentPrefix + line)
-			.join('\n');
+		// Clean simple formatting
+		const formattedQuestion =
+			`${commentPrefix}Question:\n` +
+			question
+				.split('\n')
+				.map(line => commentPrefix + line)
+				.join('\n') +
+			'\n\n';
 
-		const firstLine = editor.document.lineAt(0).text;
-
-		if (firstLine.includes('Mock Question')) {
-			const action = await vscode.window.showInformationMessage(
-				'A practice question already exists in this file.',
-				'Replace',
-				'Append',
-				'Cancel'
+		await editor.edit(editBuilder => {
+			editBuilder.insert(
+				new vscode.Position(0, 0),
+				formattedQuestion
 			);
+		});
 
-			if (action === 'Cancel' || !action) {
-				return;
-			}
-
-			if (action === 'Replace') {
-				const fullRange = new vscode.Range(
-					editor.document.positionAt(0),
-					editor.document.positionAt(editor.document.getText().length)
-				);
-
-				await editor.edit(editBuilder => {
-					editBuilder.replace(fullRange, formattedQuestion + '\n\n');
-				});
-
-				return;
-			}
-
-			if (action === 'Append') {
-				await editor.edit(editBuilder => {
-					editBuilder.insert(
-						new vscode.Position(editor.document.lineCount, 0),
-						'\n\n' + formattedQuestion
-					);
-				});
-
-				return;
-			}
-		} else {
-			await editor.edit(editBuilder => {
-				editBuilder.insert(
-					new vscode.Position(0, 0),
-					formattedQuestion + '\n\n'
-				);
-			});
-		}
+		// Enable word wrap for better readability
+		await vscode.commands.executeCommand('editor.action.toggleWordWrap');
 
 	});
 
