@@ -1,4 +1,13 @@
 import * as vscode from 'vscode';
+import * as dotenv from 'dotenv';
+import * as path from 'path';
+
+dotenv.config({
+  path: path.resolve(__dirname, '../.env')
+});
+
+import { generatePracticeQuestion } from './services/aiService';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 export function activate(context: vscode.ExtensionContext) {
 
@@ -50,10 +59,62 @@ export function activate(context: vscode.ExtensionContext) {
 			}
 		}
 
-		// Final confirmation message
-		vscode.window.showInformationMessage(
-			`Language: ${languageId} | Topic: ${detectedTopic}`
-		);
+		vscode.window.showInformationMessage('Generating practice question...');
+
+		const question = await generatePracticeQuestion(detectedTopic, languageId);
+
+		const commentPrefix = languageId === 'python' ? '# ' : '// ';
+
+		const formattedQuestion = question
+			.split('\n')
+			.map(line => commentPrefix + line)
+			.join('\n');
+
+		const firstLine = editor.document.lineAt(0).text;
+
+		if (firstLine.includes('Mock Question')) {
+			const action = await vscode.window.showInformationMessage(
+				'A practice question already exists in this file.',
+				'Replace',
+				'Append',
+				'Cancel'
+			);
+
+			if (action === 'Cancel' || !action) {
+				return;
+			}
+
+			if (action === 'Replace') {
+				const fullRange = new vscode.Range(
+					editor.document.positionAt(0),
+					editor.document.positionAt(editor.document.getText().length)
+				);
+
+				await editor.edit(editBuilder => {
+					editBuilder.replace(fullRange, formattedQuestion + '\n\n');
+				});
+
+				return;
+			}
+
+			if (action === 'Append') {
+				await editor.edit(editBuilder => {
+					editBuilder.insert(
+						new vscode.Position(editor.document.lineCount, 0),
+						'\n\n' + formattedQuestion
+					);
+				});
+
+				return;
+			}
+		} else {
+			await editor.edit(editBuilder => {
+				editBuilder.insert(
+					new vscode.Position(0, 0),
+					formattedQuestion + '\n\n'
+				);
+			});
+		}
 
 	});
 

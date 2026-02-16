@@ -1,6 +1,6 @@
 {
   "name": "codeforgex",
-  "displayName": "codeforgex",
+  "displayName": "CodeForgeX",
   "description": "AI-powered coding practice and skill-building platform inside VS Code.",
   "version": "0.0.1",
   "engines": {
@@ -9,7 +9,9 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onCommand:codeforgex.startPractice"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -28,13 +30,19 @@
     "test": "vscode-test"
   },
   "devDependencies": {
-    "@types/vscode": "^1.109.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
-    "typescript-eslint": "^8.54.0",
+    "@types/vscode": "^1.109.0",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2",
     "eslint": "^9.39.2",
     "typescript": "^5.9.3",
-    "@vscode/test-cli": "^0.0.12",
-    "@vscode/test-electron": "^2.5.2"
+    "typescript-eslint": "^8.54.0"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "dotenv": "^17.3.1",
+    "node-fetch": "^3.3.2",
+    "openai": "^6.22.0"
   }
 }
