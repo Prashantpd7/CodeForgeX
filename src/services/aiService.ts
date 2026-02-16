@@ -12,27 +12,109 @@ const openai = new OpenAI({
 
 export async function generatePracticeQuestion(
     topic: string,
-    language: string
+    language: string,
+    difficulty: string,
+    mode: string
 ): Promise<string> {
 
     try {
 
-        const prompt = `
-Generate ONE beginner-friendly coding practice question.
+        // 🔥 Mode-Based Instruction Block
+        let modeInstruction = "";
 
-Topic: ${topic}
-Programming Language: ${language}
-
-STRICT RULES:
-- DO NOT include headings.
-- DO NOT include the word "Question".
-- DO NOT include separators like ===== or ----.
-- DO NOT include any decorative formatting.
+        if (mode === "Question Only") {
+            modeInstruction = `
+- Generate ONLY the question.
+- DO NOT include hint.
 - DO NOT include solution.
-- DO NOT include explanation.
-- Return ONLY plain question text.
-- Return clean paragraph text only.
 `;
+        } else if (mode === "Question + Hint") {
+            modeInstruction = `
+- First write the question.
+- Then write a short hint.
+- Clearly separate question and hint using a blank line.
+- DO NOT include solution.
+`;
+        } else if (mode === "Full Solution") {
+            modeInstruction = `
+- First write the question.
+- Then provide the complete solution in ${language}.
+- Clearly separate question and solution using a blank line.
+`;
+        } else if (mode === "Multiple Approaches") {
+            modeInstruction = `
+- First write the question.
+- Then provide 2 different solution approaches in ${language}.
+- Clearly separate each section using blank lines.
+`;
+        }
+        let languageInstruction = "";
+
+if (language === "javascript") {
+    languageInstruction = `
+- Generate PURE JavaScript.
+- DO NOT use TypeScript type annotations.
+- DO NOT use ": number", ": string", "number[]", etc.
+- Do NOT write function signatures with types.
+`;
+}
+
+else if (language === "typescript") {
+    languageInstruction = `
+- Generate proper TypeScript.
+- Type annotations are allowed.
+`;
+}
+
+else if (language === "python") {
+    languageInstruction = `
+- Generate proper Python.
+- Do NOT use JavaScript syntax.
+`;
+}
+
+
+        const prompt = `
+        Generate ONE ${difficulty} level coding practice content.
+
+        Topic: ${topic}
+        Programming Language: ${language}
+
+        Language Rules:
+        ${languageInstruction}
+
+        Difficulty Guidelines:
+        - Easy → Basic logic
+        - Medium → Moderate logic
+        - Hard → Advanced logic, optimized approach
+
+        Mode: ${mode}
+
+        IMPORTANT OUTPUT FORMAT:
+
+        You MUST return content strictly in this format:
+
+        [QUESTION]
+        <Question text here>
+
+        ${mode === "Question Only" ? "" : `
+        ${mode === "Question + Hint" ? `
+        [HINT]
+        <Short hint only>
+        ` : ""}
+
+        ${mode === "Full Solution" || mode === "Multiple Approaches" ? `
+        [SOLUTION]
+        <Only executable ${language} code here>
+        ` : ""}
+        `}
+
+        STRICT RULES:
+        - Do NOT add anything outside these markers.
+        - Do NOT use decorative formatting.
+        - Do NOT include extra commentary.
+        - Do NOT include explanations outside sections.
+        `;
 
         const response = await openai.chat.completions.create({
             model: "gpt-4o-mini",
@@ -42,14 +124,14 @@ STRICT RULES:
             temperature: 0.6,
         });
 
-        let rawText = response.choices[0].message.content || "No question generated.";
+        let rawText = response.choices[0].message.content || "No content generated.";
 
-        // 🔥 Extra Safety: Remove unwanted formatting if AI still adds it
+        // 🔥 Cleanup Layer
         rawText = rawText
-            .replace(/=+/g, "")         // remove =====
-            .replace(/-+/g, "")         // remove ----
-            .replace(/Question:/gi, "") // remove accidental Question:
-            .trim();
+        // Remove lines that are ONLY separators like ===== or -----
+        .replace(/^\s*[=-]{3,}\s*$/gm, "")
+        .replace(/Question:/gi, "")
+        .trim();
 
         return rawText;
 
