@@ -298,7 +298,161 @@ const solutionCommand = vscode.commands.registerCommand(
 	const evaluateCommand = vscode.commands.registerCommand(
 		'codeforgex.evaluateSolution',
 		async () => {
-			vscode.window.showInformationMessage('Evaluation feature coming next.');
+			const editor = vscode.window.activeTextEditor;
+			if (!editor) {
+				vscode.window.showErrorMessage('No active file.');
+				return;
+			}
+
+			if (!storedSolution) {
+				vscode.window.showErrorMessage('No solution available for evaluation.');
+				return;
+			}
+
+			const userCode = editor.document.getText();
+			const languageId = editor.document.languageId;
+			const commentPrefix = languageId === 'python' ? '# ' : '// ';
+
+			let evaluationResult: string;
+
+			try {
+				evaluationResult = await vscode.window.withProgress(
+					{
+						location: vscode.ProgressLocation.Notification,
+						title: "Evaluating your code...",
+						cancellable: false
+					},
+					async () => {
+						const response = await openai.chat.completions.create({
+							model: "gpt-4o-mini",
+							messages: [
+								{
+									role: "user",
+									content: `You are a code reviewer. Analyze this ${languageId} code and provide a SHORT evaluation.
+
+REFERENCE SOLUTION:
+${storedSolution}
+
+USER'S CODE:
+${userCode}
+
+Respond EXACTLY in this format (no markdown, no decorators):
+
+Code Evaluation Summary:
+
+Correctness:
+<2 sentences max about correctness. Use "Your code">
+
+Edge Cases:
+<2 sentences max, or "Handles edge cases well">
+
+Time Complexity:
+<2 sentences max, or "Complexity is appropriate">
+
+Code Quality:
+<2 sentences max, or "Code is clean and readable">
+
+Final Verdict:
+<Correct / Partially Correct / Needs Improvement>
+
+IF YOUR CODE NEEDS IMPROVEMENTS, append this section ONLY IF NEEDED:
+
+Suggestions:
+
+LINE <number>:
+Issue: <brief issue description>
+Better Approach: <what to do instead>
+Example Replacement: <1-2 lines of code>
+
+Only suggest lines with clear improvements. Keep to 2-3 suggestions maximum.
+
+IMPORTANT:
+- Do NOT add markdown formatting.
+- Do NOT wrap anything in backticks.
+- Do NOT add decorative lines or borders.
+- Speak directly: "Your code" not "the user's code".
+- If no improvements needed, do NOT include Suggestions section.`
+								}
+							],
+							temperature: 0.4
+						});
+
+						return response.choices[0].message.content || "Evaluation could not be generated.";
+					}
+				);
+
+				// Parse evaluation response
+				const summaryMatch = evaluationResult.match(/Code Evaluation Summary:([\s\S]*?)(?=Suggestions:|$)/);
+				const suggestionsMatch = evaluationResult.match(/Suggestions:([\s\S]*?)$/);
+
+				const summary = summaryMatch ? summaryMatch[1].trim() : evaluationResult;
+				const suggestionsText = suggestionsMatch ? suggestionsMatch[1].trim() : '';
+
+				// Check if evaluation already exists
+				const currentFullText = editor.document.getText();
+				if (currentFullText.includes('Code Evaluation Summary:')) {
+					vscode.window.showWarningMessage('Evaluation already exists. Remove it before running again.');
+					return;
+				}
+
+				// Insert summary at end of file
+				const summaryBlock = 
+					`\n\n${commentPrefix}==== Code Evaluation Summary ====\n` +
+					summary
+						.split('\n')
+						.map(line => commentPrefix + (line.trim() ? line : ''))
+						.join('\n') +
+					`\n${commentPrefix}==================================\n`;
+
+				await editor.edit(editBuilder => {
+					editBuilder.insert(
+						new vscode.Position(editor.document.lineCount, 0),
+						summaryBlock
+					);
+				});
+
+				// Parse and insert suggestions if they exist
+				if (suggestionsText.length > 0) {
+					const lineMatches = suggestionsText.matchAll(/LINE\s*(\d+):([\s\S]*?)(?=LINE\s*\d+:|$)/gi);
+					const suggestions = Array.from(lineMatches).map(match => ({
+						lineNumber: parseInt(match[1]),
+						content: match[2].trim()
+					}));
+
+					// Sort by line number descending to avoid offset issues
+					suggestions.sort((a, b) => b.lineNumber - a.lineNumber);
+
+					const updatedText = editor.document.getText();
+					const lines = updatedText.split('\n');
+
+					for (const suggestion of suggestions) {
+						const lineIndex = suggestion.lineNumber - 1;
+						
+						if (lineIndex >= 0 && lineIndex < lines.length) {
+							// Check if suggestion already exists
+							if (!lines[lineIndex - 1]?.includes('Suggestion:')) {
+								const suggestionLines = suggestion.content
+									.split('\n')
+									.filter(line => line.trim().length > 0)
+									.map(line => commentPrefix + line.trim())
+									.join('\n');
+
+								const insertionPos = new vscode.Position(lineIndex, 0);
+								
+								await editor.edit(editBuilder => {
+									editBuilder.insert(insertionPos, suggestionLines + '\n');
+								});
+							}
+						}
+					}
+				}
+
+				vscode.window.showInformationMessage('Code evaluation complete. Review suggestions in file.');
+
+			} catch (error) {
+				vscode.window.showErrorMessage('Code evaluation failed. Please try again.');
+				console.error('Evaluation error:', error);
+			}
 		}
 	);
 	const explainCommand = vscode.commands.registerCommand(
