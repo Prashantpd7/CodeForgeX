@@ -19,43 +19,57 @@ let storedExplanation: string | null = null;
 
 // State flags for context management
 let hasQuestionFlag = false;
-let hasSolutionFlag = false;
+let solutionVisibleFlag = false;
 let hasExplanationFlag = false;
-let hintRevealedFlag = false;
+let hintVisibleFlag = false;
+let evaluationVisibleFlag = false;
 
 export function activate(context: vscode.ExtensionContext) {
 	// Initialize context keys
 	vscode.commands.executeCommand('setContext', 'codeforgex.hasQuestion', false);
-	vscode.commands.executeCommand('setContext', 'codeforgex.hasSolution', false);
+	vscode.commands.executeCommand('setContext', 'codeforgex.solutionVisible', false);
 	vscode.commands.executeCommand('setContext', 'codeforgex.hasExplanation', false);
-	vscode.commands.executeCommand('setContext', 'codeforgex.hintRevealed', false);
+	vscode.commands.executeCommand('setContext', 'codeforgex.hintVisible', false);
+	vscode.commands.executeCommand('setContext', 'codeforgex.evaluationVisible', false);
 	console.log('CodeForgeX is now active!');
 
 	// Helper function to update context flag and variable
 	async function updateContextFlag(contextKey: string, value: boolean) {
 		await vscode.commands.executeCommand('setContext', contextKey, value);
 		if (contextKey === 'codeforgex.hasQuestion') hasQuestionFlag = value;
-		if (contextKey === 'codeforgex.hasSolution') hasSolutionFlag = value;
+		if (contextKey === 'codeforgex.solutionVisible') solutionVisibleFlag = value;
 		if (contextKey === 'codeforgex.hasExplanation') hasExplanationFlag = value;
-		if (contextKey === 'codeforgex.hintRevealed') hintRevealedFlag = value;
+		if (contextKey === 'codeforgex.hintVisible') hintVisibleFlag = value;
+		if (contextKey === 'codeforgex.evaluationVisible') evaluationVisibleFlag = value;
 	}
 
 	// Build available actions based on current state
 	function buildAvailableActions(): string[] {
 		const actions: string[] = [];
 		
-		if (hasQuestionFlag && !hintRevealedFlag) {
-			actions.push('Show Hint');
-		}
-		if (hasQuestionFlag && !hasSolutionFlag) {
+		// Before solution is shown, manage hint toggle
+		if (hasQuestionFlag && !solutionVisibleFlag) {
+			if (hintVisibleFlag) {
+				actions.push('Hide Hint');
+			} else {
+				actions.push('Show Hint');
+			}
 			actions.push('Show Solution');
 		}
-		if (hasSolutionFlag && !hasExplanationFlag) {
-			actions.push('Explain Code');
+		
+		// After solution is shown
+		if (solutionVisibleFlag) {
+			if (!hasExplanationFlag) {
+				actions.push('Explain Code');
+			}
+			if (evaluationVisibleFlag) {
+				actions.push('Remove Evaluation');
+			} else {
+				actions.push('Evaluate Code');
+			}
 		}
-		if (hasSolutionFlag) {
-			actions.push('Evaluate Code');
-		}
+		
+		// Explanation handling
 		if (hasExplanationFlag) {
 			actions.push('Remove Explanation');
 		}
@@ -85,10 +99,12 @@ export function activate(context: vscode.ExtensionContext) {
 			// ================================
 			if (!hasQuestion) {
 				// Reset context keys for new question
-			await updateContextFlag('codeforgex.hintRevealed', false);
-			await updateContextFlag('codeforgex.hasSolution', false);
+			await updateContextFlag('codeforgex.hintVisible', false);
+			await updateContextFlag('codeforgex.solutionVisible', false);
 			await updateContextFlag('codeforgex.hasExplanation', false);
-				const fileName = editor.document.fileName;
+			await updateContextFlag('codeforgex.evaluationVisible', false);
+
+			const fileName = editor.document.fileName;
 				const baseName = fileName.split('/').pop()?.toLowerCase() || '';
 
 				let detectedTopic = 'General Programming';
@@ -209,6 +225,10 @@ try {
 			await vscode.commands.executeCommand('codeforgex.showHint');
 		}
 
+		if (action === 'Hide Hint') {
+			await vscode.commands.executeCommand('codeforgex.hideHint');
+		}
+
 		if (action === 'Show Solution') {
 			await vscode.commands.executeCommand('codeforgex.showSolution');
 		}
@@ -219,6 +239,10 @@ try {
 
 		if (action === 'Evaluate Code') {
 			await vscode.commands.executeCommand('codeforgex.evaluateSolution');
+		}
+
+		if (action === 'Remove Evaluation') {
+			await vscode.commands.executeCommand('codeforgex.removeEvaluation');
 		}
 
 		if (action === 'Remove Explanation') {
@@ -245,22 +269,148 @@ try {
 			const commentPrefix = editor.document.languageId === 'python' ? '# ' : '// ';
 
 			const hintContent =
-				`\n${commentPrefix}Hint:\n` +
-				storedHint
-					.split('\n')
-					.map(line => commentPrefix + line)
-					.join('\n') +
-				'\n\n';
+			`\n${commentPrefix}Hint:\n` +
+			storedHint
+				.split('\n')
+				.map(line => commentPrefix + line)
+				.join('\n') +
+			'\n\n';
 
-			await editor.edit(editBuilder => {
-				editBuilder.insert(
-					new vscode.Position(editor.document.lineCount, 0),
-					hintContent
-				);
-			});
+		await editor.edit(editBuilder => {
+			editBuilder.insert(
+				new vscode.Position(editor.document.lineCount, 0),
+				hintContent
+			);
+		});
 
-		// Set context key to hide this menu item
-		await updateContextFlag('codeforgex.hintRevealed', true);
+		// Set context key to show hide hint button
+		await updateContextFlag('codeforgex.hintVisible', true);
+	}
+);
+
+const hideHintCommand = vscode.commands.registerCommand(
+	'codeforgex.hideHint',
+	async () => {
+		const editor = vscode.window.activeTextEditor;
+		if (!editor) {
+			vscode.window.showErrorMessage('No active file.');
+			return;
+		}
+
+		const currentText = editor.document.getText();
+		const lines = currentText.split('\n');
+		const commentPrefix = editor.document.languageId === 'python' ? '# ' : '// ';
+		const commentChar = commentPrefix.trim(); // '#' or '//'
+
+		// Find the line that starts with "# Hint:" or "// Hint:"
+		let hintStartIndex = -1;
+		for (let i = 0; i < lines.length; i++) {
+			if (lines[i].trim().startsWith(commentPrefix + 'Hint:')) {
+				hintStartIndex = i;
+				break;
+			}
+		}
+
+		if (hintStartIndex === -1) {
+			vscode.window.showErrorMessage('Hint not found.');
+			return;
+		}
+
+		// Find end of hint block (consecutive comment lines)
+		let hintEndIndex = hintStartIndex;
+		for (let i = hintStartIndex + 1; i < lines.length; i++) {
+			const trimmedLine = lines[i].trim();
+			// Continue if line is empty or starts with comment character
+			if (trimmedLine === '' || trimmedLine.startsWith(commentChar)) {
+				hintEndIndex = i;
+				// Stop at blank line
+				if (trimmedLine === '') {
+					break;
+				}
+			} else {
+				// Non-comment line found, stop here
+				hintEndIndex = i - 1;
+				break;
+			}
+		}
+
+		// Remove the hint block
+		lines.splice(hintStartIndex, hintEndIndex - hintStartIndex + 1);
+		const newText = lines.join('\n');
+
+		await editor.edit(editBuilder => {
+			const fullRange = new vscode.Range(
+				editor.document.positionAt(0),
+				editor.document.positionAt(currentText.length)
+			);
+			editBuilder.replace(fullRange, newText);
+		});
+
+		await updateContextFlag('codeforgex.hintVisible', false);
+		vscode.window.showInformationMessage('Hint hidden.');
+	}
+);
+
+const removeHintCommand = vscode.commands.registerCommand(
+	'codeforgex.removeHint',
+	async () => {
+		const editor = vscode.window.activeTextEditor;
+		if (!editor) {
+			vscode.window.showErrorMessage('No active file.');
+			return;
+		}
+
+		const currentText = editor.document.getText();
+		const lines = currentText.split('\n');
+		const commentPrefix = editor.document.languageId === 'python' ? '# ' : '// ';
+		const commentChar = commentPrefix.trim(); // '#' or '//'
+
+		// Find the line that starts with "# Hint:" or "// Hint:"
+		let hintStartIndex = -1;
+		for (let i = 0; i < lines.length; i++) {
+			if (lines[i].trim().startsWith(commentPrefix + 'Hint:')) {
+				hintStartIndex = i;
+				break;
+			}
+		}
+
+		if (hintStartIndex === -1) {
+			vscode.window.showErrorMessage('Hint not found.');
+			return;
+		}
+
+		// Find end of hint block (consecutive comment lines)
+		let hintEndIndex = hintStartIndex;
+		for (let i = hintStartIndex + 1; i < lines.length; i++) {
+			const trimmedLine = lines[i].trim();
+			// Continue if line is empty or starts with comment character
+			if (trimmedLine === '' || trimmedLine.startsWith(commentChar)) {
+				hintEndIndex = i;
+				// Stop at blank line
+				if (trimmedLine === '') {
+					break;
+				}
+			} else {
+				// Non-comment line found, stop here
+				hintEndIndex = i - 1;
+				break;
+			}
+		}
+
+		// Remove the hint block
+		lines.splice(hintStartIndex, hintEndIndex - hintStartIndex + 1);
+		const newText = lines.join('\n');
+
+		await editor.edit(editBuilder => {
+			const fullRange = new vscode.Range(
+				editor.document.positionAt(0),
+				editor.document.positionAt(currentText.length)
+			);
+			editBuilder.replace(fullRange, newText);
+		});
+
+		await updateContextFlag('codeforgex.hintVisible', false);
+		vscode.window.showInformationMessage('Hint removed.');
 	}
 );
 
@@ -291,7 +441,7 @@ const solutionCommand = vscode.commands.registerCommand(
 		});
 
 		// Set context key to show explain and evaluate options
-		await updateContextFlag('codeforgex.hasSolution', true);
+		await updateContextFlag('codeforgex.solutionVisible', true);
 	}
 );
 
@@ -397,21 +547,22 @@ IMPORTANT:
 
 				// Insert summary at end of file
 				const summaryBlock = 
-					`\n\n${commentPrefix}==== Code Evaluation Summary ====\n` +
-					summary
-						.split('\n')
-						.map(line => commentPrefix + (line.trim() ? line : ''))
-						.join('\n') +
-					`\n${commentPrefix}==================================\n`;
+			`\n\n${commentPrefix}Evaluation:\n` +
+			summary
+				.split('\n')
+				.map(line => commentPrefix + (line.trim() ? line : ''))
+				.join('\n') +
+			'\n';
 
-				await editor.edit(editBuilder => {
-					editBuilder.insert(
-						new vscode.Position(editor.document.lineCount, 0),
-						summaryBlock
-					);
-				});
+		await editor.edit(editBuilder => {
+			editBuilder.insert(
+				new vscode.Position(editor.document.lineCount, 0),
+				summaryBlock
+			);
+		});
 
-				// Parse and insert suggestions if they exist
+		// Set evaluation flag
+		await updateContextFlag('codeforgex.evaluationVisible', true);
 				if (suggestionsText.length > 0) {
 					const lineMatches = suggestionsText.matchAll(/LINE\s*(\d+):([\s\S]*?)(?=LINE\s*\d+:|$)/gi);
 					const suggestions = Array.from(lineMatches).map(match => ({
@@ -570,13 +721,79 @@ const removeExplanationCommand = vscode.commands.registerCommand(
 	}
 );
 
+const removeEvaluationCommand = vscode.commands.registerCommand(
+	'codeforgex.removeEvaluation',
+	async () => {
+		const editor = vscode.window.activeTextEditor;
+		if (!editor) {
+			vscode.window.showErrorMessage('No active file.');
+			return;
+		}
+
+		const currentText = editor.document.getText();
+		const lines = currentText.split('\n');
+		const commentPrefix = editor.document.languageId === 'python' ? '# ' : '// ';
+		const commentChar = commentPrefix.trim(); // '#' or '//'
+
+		// Find the line that starts with "# Evaluation:" or "// Evaluation:"
+		let evalStartIndex = -1;
+		for (let i = 0; i < lines.length; i++) {
+			if (lines[i].trim().startsWith(commentPrefix + 'Evaluation:')) {
+				evalStartIndex = i;
+				break;
+			}
+		}
+
+		if (evalStartIndex === -1) {
+			vscode.window.showErrorMessage('Evaluation not found.');
+			return;
+		}
+
+		// Find end of evaluation block (consecutive comment lines)
+		let evalEndIndex = evalStartIndex;
+		for (let i = evalStartIndex + 1; i < lines.length; i++) {
+			const trimmedLine = lines[i].trim();
+			// Continue if line is empty or starts with comment character
+			if (trimmedLine === '' || trimmedLine.startsWith(commentChar)) {
+				evalEndIndex = i;
+				// Stop at blank line
+				if (trimmedLine === '') {
+					break;
+				}
+			} else {
+				// Non-comment line found, stop here
+				evalEndIndex = i - 1;
+				break;
+			}
+		}
+
+		// Remove the evaluation block
+		lines.splice(evalStartIndex, evalEndIndex - evalStartIndex + 1);
+		const newText = lines.join('\n');
+
+		await editor.edit(editBuilder => {
+			const fullRange = new vscode.Range(
+				editor.document.positionAt(0),
+				editor.document.positionAt(currentText.length)
+			);
+			editBuilder.replace(fullRange, newText);
+		});
+
+		await updateContextFlag('codeforgex.evaluationVisible', false);
+		vscode.window.showInformationMessage('Evaluation removed.');
+	}
+);
+
 	context.subscriptions.push(
 		disposable,
 		hintCommand,
+		hideHintCommand,
+		removeHintCommand,
 		solutionCommand,
 		evaluateCommand,
 		explainCommand,
-		removeExplanationCommand
+		removeExplanationCommand,
+		removeEvaluationCommand
 	);
 }
 

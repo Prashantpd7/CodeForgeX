@@ -25,12 +25,20 @@
         "title": "Show Hint"
       },
       {
+        "command": "codeforgex.removeHint",
+        "title": "Remove Hint"
+      },
+      {
         "command": "codeforgex.showSolution",
         "title": "Show Solution"
       },
       {
         "command": "codeforgex.evaluateSolution",
         "title": "Evaluate Code"
+      },
+      {
+        "command": "codeforgex.removeEvaluation",
+        "title": "Remove Evaluation"
       },
       {
         "command": "codeforgex.explainCode",
