@@ -59,7 +59,7 @@ A helpful hint for solving the problem.
 [SOLUTION]
 Complete correct solution in ${language}.
 
-Rules:
+Rules for [SOLUTION]:
 - DO NOT wrap the solution in markdown.
 - DO NOT use triple backticks.
 - Return raw code only inside [SOLUTION].
@@ -67,6 +67,16 @@ Rules:
 - Do not add explanations outside blocks.
 - Do not remove the block labels.
 - Solution must be valid runnable ${language} code.
+- Solution MUST include both function definition AND an execution block.
+- After defining the function, ALWAYS include a small execution block that:
+  * Calls the function with sample input.
+  * Prints or logs the result.
+${language === 'python' ? `- For Python: Add execution block as:
+  if __name__ == "__main__":
+      print(function_name(sample_input))` : `- For ${language}: Add execution block as:
+  console.log(function_name(sample_input));`}
+- The code must be immediately runnable when user clicks Run.
+- Do not include any markdown or explanations.
 `;
 
         const response = await openai.chat.completions.create({
