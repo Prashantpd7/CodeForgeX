@@ -21,6 +21,18 @@ let storedHint: string | null = null;
 let storedSolution: string | null = null;
 let storedExplanation: string | null = null;
 
+// Feature 1: tracks whether question came from user-written text (not AI-generated)
+let isUserWrittenQuestion = false;
+
+// Feature 2: Selection explanation — snapshot-based, supports multiple explains.
+// selectionFileSnapshot: full file content saved at the moment of FIRST explain.
+//   Used by "Remove Selection Explanation" to restore everything at once.
+// selectionExplainedBlocks: each explained block text, used to detect manual deletion.
+// hasSelectionExplanationFlag: true when at least one explain has been inserted.
+let selectionFileSnapshot: string | null = null;
+let selectionExplainedBlocks: string[] = [];
+let hasSelectionExplanationFlag = false;
+
 // State flags for context management
 let hasQuestionFlag = false;
 let solutionVisibleFlag = false;
@@ -36,7 +48,39 @@ let timerStarted = false;
 // ignores those events and never accidentally starts the timer.
 let isExtensionEditing = false;
 
-
+// ─────────────────────────────────────────────────────────────
+// FIX 2 & 3: detectManualQuestion
+// Detects common coding question patterns for manually pasted
+// questions. Used in onDidChangeTextDocument so the timer starts
+// correctly even when the user pastes their own question without
+// going through AI generation. Also fixes Problem 3 because once
+// hasQuestionFlag is set, buildAvailableActions() works identically
+// for manual and AI-generated flows.
+// ─────────────────────────────────────────────────────────────
+function detectManualQuestion(text: string): boolean {
+	if (text.includes('Question (')) return true;
+	const patterns = [
+		/write\s+a\s+function/i,
+		/write\s+a\s+program/i,
+		/implement\s+a/i,
+		/implement\s+the/i,
+		/create\s+a\s+function/i,
+		/create\s+a\s+program/i,
+		/given\s+an?\s+array/i,
+		/given\s+a\s+string/i,
+		/given\s+a\s+list/i,
+		/given\s+a\s+number/i,
+		/find\s+the\s+/i,
+		/return\s+the\s+/i,
+		/design\s+a\s+/i,
+		/you\s+are\s+given/i,
+		/your\s+task\s+is/i,
+		/write\s+an?\s+algorithm/i,
+		/solve\s+the\s+following/i,
+		/complete\s+the\s+function/i,
+	];
+	return patterns.some(p => p.test(text));
+}
 
 export function activate(context: vscode.ExtensionContext) {
 	// Initialize context keys
@@ -67,14 +111,12 @@ export function activate(context: vscode.ExtensionContext) {
 
 	// =====================================
 	// START TIMER ON FIRST USER TYPING
+	// FIX 2: Uses detectManualQuestion() so manually pasted questions
+	//        trigger the timer correctly, not just AI-generated ones.
+	// FIX 5: Re-evaluates hasExplanationFlag on every real document
+	//        change so undo/redo keeps Remove Explanation in sync.
 	// =====================================
-	// The guard flag isExtensionEditing is checked FIRST.
-	// Any programmatic edit (question insert, hint, solution,
-	// evaluation, explanation, or the save() inside runActiveFile)
-	// sets isExtensionEditing = true beforehand, so those events
-	// are silently ignored here and will never start the timer.
-	// Only genuine keystrokes by the user pass all checks.
-	vscode.workspace.onDidChangeTextDocument((event) => {
+	vscode.workspace.onDidChangeTextDocument(async (event) => {
 
 		// Block ALL programmatic edits (editor.edit + save inside runService)
 		if (isExtensionEditing) return;
@@ -85,16 +127,61 @@ export function activate(context: vscode.ExtensionContext) {
 		// Only track the active file
 		if (event.document !== editor.document) return;
 
+		// ─────────────────────────────────────────────────────────────
+		// FIX 5: Undo/Redo state sync for explanation flag.
+		// After every real document change (including undo/redo),
+		// re-check whether storedExplanation still exists in the file
+		// and sync hasExplanationFlag accordingly. This costs only one
+		// string check per keystroke and needs no markers.
+		// ─────────────────────────────────────────────────────────────
+		if (storedExplanation) {
+			const docText = event.document.getText();
+			const explanationPresent = docText.includes(storedExplanation);
+			if (explanationPresent !== hasExplanationFlag) {
+				await updateContextFlag('codeforgex.hasExplanation', explanationPresent);
+			}
+		}
+
+		// Auto-reset selection explanation if user manually deleted all explained blocks.
+		// Check each stored block — if NONE of them exist in the file anymore, clear state.
+		if (hasSelectionExplanationFlag && selectionExplainedBlocks.length > 0) {
+			const currentContent = event.document.getText();
+			const anyBlockStillExists = selectionExplainedBlocks.some(
+				block => currentContent.includes(block)
+			);
+			if (!anyBlockStillExists) {
+				hasSelectionExplanationFlag = false;
+				selectionExplainedBlocks = [];
+				selectionFileSnapshot = null;
+			}
+		}
+
+		// ── FIX 2: Auto-detect manually pasted question ───────────────
+		// Set hasQuestionFlag SYNCHRONOUSLY first so the timer check
+		// on this SAME event sees the updated value immediately.
+		// VS Code does not await async event handlers, so if we only
+		// relied on the await inside updateContextFlag, the in-memory
+		// flag would be set but the timer check below would have already
+		// read the old value. Setting it directly here solves that.
+		if (!hasQuestionFlag) {
+			const docText = event.document.getText();
+			if (detectManualQuestion(docText)) {
+				hasQuestionFlag = true; // sync — makes timer check below work immediately
+				updateContextFlag('codeforgex.hasQuestion', true); // async — updates VS Code context (no await needed here)
+			}
+		}
+
 		// Timer already running — nothing to do
 		if (timerStarted) return;
 
-		// Only relevant once a question has been generated
-		const hasQuestion = editor.document.getText().includes("Question (");
-		if (!hasQuestion) return;
+		// Only relevant once a question has been detected (AI or manual)
+		if (!hasQuestionFlag) return;
 
 		// A real keystroke: nothing was deleted/replaced AND new text arrived.
 		// Cursor blinks, cursor moves, saves, and auto-format all produce either
 		// zero contentChanges or changes where text === '' — they all fail here.
+		// NOTE: rangeLength > 0 means text was replaced/deleted — we skip those
+		// so that paste-over-selection doesn't trigger the timer either.
 		const userTyped = event.contentChanges.some(change =>
 			change.rangeLength === 0 && change.text.length > 0
 		);
@@ -118,7 +205,8 @@ export function activate(context: vscode.ExtensionContext) {
 		if (contextKey === 'codeforgex.evaluationVisible') evaluationVisibleFlag = value;
 	}
 
-	// Build available actions based on current state
+	// Build available actions based on current state.
+	// Selection-based actions are injected by the caller after this returns.
 	function buildAvailableActions(): string[] {
 		const actions: string[] = [];
 
@@ -152,9 +240,97 @@ export function activate(context: vscode.ExtensionContext) {
 		return actions;
 	}
 
+	// Re-sync all in-memory flags against actual file content.
+	// Called every time startPractice dropdown is about to be shown,
+	// so that deletes, undos, and redos are always reflected correctly.
+	function syncFlagsFromFile(editor: vscode.TextEditor): void {
+		const content = editor.document.getText();
+		const trimmed = content.trim();
+
+		// If file is empty or has no question marker and hasQuestionFlag thinks there is one,
+		// reset everything — user wiped the file.
+		if (hasQuestionFlag) {
+			const hasAiQuestion = content.includes('Question (');
+			const hasUserQuestion = isUserWrittenQuestion && trimmed.length > 0;
+			if (!hasAiQuestion && !hasUserQuestion) {
+				hasQuestionFlag = false;
+				hintVisibleFlag = false;
+				solutionVisibleFlag = false;
+				hasExplanationFlag = false;
+				evaluationVisibleFlag = false;
+				return; // nothing more to check
+			}
+		}
+
+		// Sync hint visibility — check if "Hint:" marker is in file
+		if (hintVisibleFlag && !content.includes('Hint:')) {
+			hintVisibleFlag = false;
+		}
+
+		// Sync solution visibility — check if stored solution code is in file
+		if (solutionVisibleFlag && storedSolution && !content.includes(storedSolution)) {
+			solutionVisibleFlag = false;
+		}
+
+		// Sync explanation visibility — check if stored explanation is in file
+		if (hasExplanationFlag && storedExplanation && !content.includes(storedExplanation)) {
+			hasExplanationFlag = false;
+		}
+
+		// Sync evaluation visibility — check if evaluation marker is in file
+		if (evaluationVisibleFlag && !content.includes('Code Evaluation Summary:')) {
+			evaluationVisibleFlag = false;
+		}
+	}
+
+	// Returns true if question exists — either AI-generated header in file
+	// OR in-memory flag is set (covers user-written question sessions where
+	// no "Question (" header is inserted into the file).
 	function detectQuestionInFile(editor: vscode.TextEditor): boolean {
+		if (hasQuestionFlag) return true;
 		const content = editor.document.getText();
 		return content.includes('Question (');
+	}
+
+	// Feature 1: Detects if the file has a user-written question in comments
+	// at the top (before any code), but NO AI-generated "Question (" header.
+	// Returns the extracted question text, or null if not found.
+	function extractUserWrittenQuestion(editor: vscode.TextEditor): string | null {
+		const content = editor.document.getText();
+
+		// If question already active (AI-generated or user-written), do not re-detect
+		if (hasQuestionFlag) return null;
+		if (content.includes('Question (')) return null;
+
+		const lines = content.split('\n');
+		const languageId = editor.document.languageId;
+		const commentPrefix = languageId === 'python' ? '#' : '//';
+
+		const questionLines: string[] = [];
+
+		for (const line of lines) {
+			const trimmed = line.trim();
+
+			// Skip empty lines at top
+			if (trimmed === '') {
+				if (questionLines.length === 0) continue;
+				else break; // blank line ends the comment block
+			}
+
+			// Must be a comment line
+			if (!trimmed.startsWith(commentPrefix)) break;
+
+			// Strip the comment prefix and collect
+			const text = trimmed.replace(new RegExp(`^${commentPrefix}\\s*`), '').trim();
+			if (text.length > 0) {
+				questionLines.push(text);
+			}
+		}
+
+		// Need at least one non-empty comment line to count as a question
+		if (questionLines.length === 0) return null;
+
+		return questionLines.join(' ');
 	}
 
 	const timerControlCommand = vscode.commands.registerCommand(
@@ -208,158 +384,259 @@ export function activate(context: vscode.ExtensionContext) {
 			// GENERATE QUESTION
 			// ================================
 			if (!hasQuestion) {
-				// Reset context keys for new question
-				await updateContextFlag('codeforgex.hintVisible', false);
-				await updateContextFlag('codeforgex.solutionVisible', false);
-				await updateContextFlag('codeforgex.hasExplanation', false);
-				await updateContextFlag('codeforgex.evaluationVisible', false);
 
-				const fileName = editor.document.fileName;
-				const baseName = fileName.split('/').pop()?.toLowerCase() || '';
+				// ─────────────────────────────────────────────────────
+				// FEATURE 1: Check if user wrote their own question
+				// in comments at the top of the file.
+				// If yes → generate hint+solution silently, set flags,
+				// then fall through to dropdown immediately.
+				// ─────────────────────────────────────────────────────
+				const userQuestion = extractUserWrittenQuestion(editor);
 
-				let detectedTopic = 'General Programming';
+				if (userQuestion) {
+					const languageId = editor.document.languageId;
 
-				if (baseName.includes('binary') || baseName.includes('search')) {
-					detectedTopic = 'Searching';
-				} else if (baseName.includes('sort')) {
-					detectedTopic = 'Sorting';
-				} else if (baseName.includes('linked') || baseName.includes('list')) {
-					detectedTopic = 'Linked List';
-				}
-
-				const topicDecision = await vscode.window.showInformationMessage(
-					`Detected Topic: ${detectedTopic}`,
-					{ modal: true },
-					'Continue',
-					'Change Topic'
-				);
-
-				if (!topicDecision) return;
-
-				if (topicDecision === 'Change Topic') {
-					const manualTopic = await vscode.window.showInputBox({
-						prompt: 'Enter topic name manually'
-					});
-
-					if (manualTopic && manualTopic.trim() !== '') {
-						detectedTopic = manualTopic.trim();
+					let aiContent: string;
+					try {
+						// Show progress spinner so UI doesn't appear frozen during AI call
+						aiContent = await vscode.window.withProgress(
+							{
+								location: vscode.ProgressLocation.Notification,
+								title: "Generating hint and solution for your question...",
+								cancellable: false
+							},
+							async () => {
+								return await generatePracticeQuestion(
+									userQuestion,
+									languageId,
+									'Medium'
+								);
+							}
+						);
+					} catch {
+						vscode.window.showErrorMessage('AI generation failed.');
+						return;
 					}
-				}
 
-				const difficulty = await vscode.window.showQuickPick(
-					['Easy', 'Medium', 'Hard'],
-					{ placeHolder: 'Select difficulty level' }
-				);
+					// Parse hint and solution only — question is not inserted
+					const hintMatch = aiContent.match(/\[HINT\]([\s\S]*?)(?=\[SOLUTION\]|$)/);
+					const solutionMatch = aiContent.match(/\[SOLUTION\]([\s\S]*)/);
 
-				if (!difficulty) return;
+					storedHint = hintMatch ? hintMatch[1].trim() : null;
+					storedSolution = solutionMatch ? solutionMatch[1].trim() : null;
+					isUserWrittenQuestion = true;
 
-				const languageId = editor.document.languageId;
-				let aiContent: string;
+					// Set flags exactly like normal generation
+					await updateContextFlag('codeforgex.hintVisible', false);
+					await updateContextFlag('codeforgex.solutionVisible', false);
+					await updateContextFlag('codeforgex.hasExplanation', false);
+					await updateContextFlag('codeforgex.evaluationVisible', false);
+					await updateContextFlag('codeforgex.hasQuestion', true);
 
-				try {
-					aiContent = await vscode.window.withProgress(
-						{
-							location: vscode.ProgressLocation.Notification,
-							title: "Generating practice question...",
-							cancellable: false
-						},
-						async () => {
-							return await generatePracticeQuestion(
-								detectedTopic,
-								languageId,
-								difficulty
-							);
-						}
+					// DO NOT return — fall through to the dropdown below immediately
+
+				} else {
+					// No user-written question found — normal AI question generation flow
+					isUserWrittenQuestion = false;
+
+					// Reset context keys for new question
+					await updateContextFlag('codeforgex.hintVisible', false);
+					await updateContextFlag('codeforgex.solutionVisible', false);
+					await updateContextFlag('codeforgex.hasExplanation', false);
+					await updateContextFlag('codeforgex.evaluationVisible', false);
+
+					const fileName = editor.document.fileName;
+					const baseName = fileName.split('/').pop()?.toLowerCase() || '';
+
+					let detectedTopic = 'General Programming';
+
+					if (baseName.includes('binary') || baseName.includes('search')) {
+						detectedTopic = 'Searching';
+					} else if (baseName.includes('sort')) {
+						detectedTopic = 'Sorting';
+					} else if (baseName.includes('linked') || baseName.includes('list')) {
+						detectedTopic = 'Linked List';
+					}
+
+					const topicDecision = await vscode.window.showInformationMessage(
+						`Detected Topic: ${detectedTopic}`,
+						{ modal: true },
+						'Continue',
+						'Change Topic'
 					);
-				} catch {
-					vscode.window.showErrorMessage('AI generation failed.');
+
+					if (!topicDecision) return;
+
+					if (topicDecision === 'Change Topic') {
+						const manualTopic = await vscode.window.showInputBox({
+							prompt: 'Enter topic name manually'
+						});
+
+						if (manualTopic && manualTopic.trim() !== '') {
+							detectedTopic = manualTopic.trim();
+						}
+					}
+
+					const difficulty = await vscode.window.showQuickPick(
+						['Easy', 'Medium', 'Hard'],
+						{ placeHolder: 'Select difficulty level' }
+					);
+
+					if (!difficulty) return;
+
+					const languageId = editor.document.languageId;
+					let aiContent: string;
+
+					try {
+						aiContent = await vscode.window.withProgress(
+							{
+								location: vscode.ProgressLocation.Notification,
+								title: "Generating practice question...",
+								cancellable: false
+							},
+							async () => {
+								return await generatePracticeQuestion(
+									detectedTopic,
+									languageId,
+									difficulty
+								);
+							}
+						);
+					} catch {
+						vscode.window.showErrorMessage('AI generation failed.');
+						return;
+					}
+
+					const commentPrefix = languageId === 'python' ? '# ' : '// ';
+					const headerLine = `${commentPrefix}Question (${difficulty})\n\n`;
+
+					const questionMatch = aiContent.match(/\[QUESTION\]([\s\S]*?)(?=\[HINT\]|\[SOLUTION\]|$)/);
+					const hintMatch = aiContent.match(/\[HINT\]([\s\S]*?)(?=\[SOLUTION\]|$)/);
+					const solutionMatch = aiContent.match(/\[SOLUTION\]([\s\S]*)/);
+
+					storedHint = hintMatch ? hintMatch[1].trim() : null;
+					storedSolution = solutionMatch ? solutionMatch[1].trim() : null;
+
+					let finalContent = headerLine;
+
+					if (questionMatch) {
+						finalContent += questionMatch[1]
+							.trim()
+							.split('\n')
+							.map(line => commentPrefix + line)
+							.join('\n') + '\n\n';
+					}
+
+					// Guard: question insertion must not start the timer
+					isExtensionEditing = true;
+					await editor.edit(editBuilder => {
+						editBuilder.insert(
+							new vscode.Position(0, 0),
+							finalContent
+						);
+					});
+					isExtensionEditing = false;
+
+					await vscode.workspace.getConfiguration('editor').update(
+						'wordWrap',
+						'on',
+						vscode.ConfigurationTarget.Workspace
+					);
+
+					// Set context key and return — normal flow ends here
+					await updateContextFlag('codeforgex.hasQuestion', true);
 					return;
 				}
-
-				const commentPrefix = languageId === 'python' ? '# ' : '// ';
-				const headerLine = `${commentPrefix}Question (${difficulty})\n\n`;
-
-				const questionMatch = aiContent.match(/\[QUESTION\]([\s\S]*?)(?=\[HINT\]|\[SOLUTION\]|$)/);
-				const hintMatch = aiContent.match(/\[HINT\]([\s\S]*?)(?=\[SOLUTION\]|$)/);
-				const solutionMatch = aiContent.match(/\[SOLUTION\]([\s\S]*)/);
-
-				storedHint = hintMatch ? hintMatch[1].trim() : null;
-				storedSolution = solutionMatch ? solutionMatch[1].trim() : null;
-
-				let finalContent = headerLine;
-
-				if (questionMatch) {
-					finalContent += questionMatch[1]
-						.trim()
-						.split('\n')
-						.map(line => commentPrefix + line)
-						.join('\n') + '\n\n';
-				}
-
-				// Guard: question insertion must not start the timer
-				isExtensionEditing = true;
-				await editor.edit(editBuilder => {
-					editBuilder.insert(
-						new vscode.Position(0, 0),
-						finalContent
-					);
-				});
-				isExtensionEditing = false;
-
-				await vscode.workspace.getConfiguration('editor').update(
-					'wordWrap',
-					'on',
-					vscode.ConfigurationTarget.Workspace
-				);
-
-				// Set context key to show menu items
-				await updateContextFlag('codeforgex.hasQuestion', true);
-				return;
 			}
 
 			// ================================
 			// IF QUESTION EXISTS → Show Tools
+			// (also reached after user-written question generation above)
+			// FIX 1: Wrapped in while(true) loop so QuickPick reappears
+			// after each action. Breaks only when user presses Escape.
 			// ================================
-			const availableActions = buildAvailableActions();
 
-			if (availableActions.length === 0) {
-				vscode.window.showInformationMessage('No actions available.');
+			// Re-sync all flags from actual file content before building dropdown.
+			// This ensures deletes, undos, and redos are always reflected correctly.
+			syncFlagsFromFile(editor);
+
+			// If syncFlagsFromFile determined there's no longer a question,
+			// treat this click as a fresh start.
+			if (!hasQuestionFlag) {
+				vscode.window.showInformationMessage('No question found. Use Start Practice to generate one.');
 				return;
 			}
 
-			const action = await vscode.window.showQuickPick(
-				availableActions,
-				{ placeHolder: 'Select action' }
-			);
+			// FIX 1: while loop keeps QuickPick alive after each action.
+			// User presses Escape (action === undefined) to dismiss.
+			while (true) {
 
-			if (!action) return;
+				// Selection check: independent of all question state flags.
+				const selection = editor.selection;
+				const hasSelection = !selection.isEmpty;
 
-			if (action === 'Show Hint') {
-				await vscode.commands.executeCommand('codeforgex.showHint');
-			}
+				// Build state-based actions first
+				const availableActions = buildAvailableActions();
 
-			if (action === 'Hide Hint') {
-				await vscode.commands.executeCommand('codeforgex.hideHint');
-			}
+				// Inject selection actions at the top:
+				// - "Explain Selection" appears whenever text is selected (always)
+				// - "Remove Selection Explanation" appears whenever explanations exist
+				// These are NOT mutually exclusive — both can appear simultaneously.
+				if (hasSelectionExplanationFlag) {
+					availableActions.unshift('Remove Selection Explanation');
+				}
+				if (hasSelection) {
+					availableActions.unshift('Explain Selection');
+				}
 
-			if (action === 'Show Solution') {
-				await vscode.commands.executeCommand('codeforgex.showSolution');
-			}
+				if (availableActions.length === 0) {
+					vscode.window.showInformationMessage('No actions available.');
+					break;
+				}
 
-			if (action === 'Explain Code') {
-				await vscode.commands.executeCommand('codeforgex.explainCode');
-			}
+				const action = await vscode.window.showQuickPick(
+					availableActions,
+					{ placeHolder: 'Select action — press Esc to close' }
+				);
 
-			if (action === 'Evaluate Code') {
-				await vscode.commands.executeCommand('codeforgex.evaluateSolution');
-			}
+				// Escape pressed → exit loop
+				if (!action) break;
 
-			if (action === 'Remove Evaluation') {
-				await vscode.commands.executeCommand('codeforgex.removeEvaluation');
-			}
+				if (action === 'Explain Selection') {
+					await vscode.commands.executeCommand('codeforgex.explainSelection');
+				}
 
-			if (action === 'Remove Explanation') {
-				await vscode.commands.executeCommand('codeforgex.removeExplanation');
+				if (action === 'Remove Selection Explanation') {
+					await vscode.commands.executeCommand('codeforgex.removeSelectionExplanation');
+				}
+
+				if (action === 'Show Hint') {
+					await vscode.commands.executeCommand('codeforgex.showHint');
+				}
+
+				if (action === 'Hide Hint') {
+					await vscode.commands.executeCommand('codeforgex.hideHint');
+				}
+
+				if (action === 'Show Solution') {
+					await vscode.commands.executeCommand('codeforgex.showSolution');
+				}
+
+				if (action === 'Explain Code') {
+					await vscode.commands.executeCommand('codeforgex.explainCode');
+				}
+
+				if (action === 'Evaluate Code') {
+					await vscode.commands.executeCommand('codeforgex.evaluateSolution');
+				}
+
+				if (action === 'Remove Evaluation') {
+					await vscode.commands.executeCommand('codeforgex.removeEvaluation');
+				}
+
+				if (action === 'Remove Explanation') {
+					await vscode.commands.executeCommand('codeforgex.removeExplanation');
+				}
 			}
 		}
 	);
@@ -797,20 +1074,34 @@ ${storedSolution}
 
 				const currentText = editor.document.getText();
 
-				// Replace only solution block
-				const updatedText = currentText.replace(
-					storedSolution!,
-					explainedCode.trim()
+				// ── FIX 4: Safe line-boundary insertion ──────────────────────
+				// Old approach: currentText.replace(storedSolution, explainedCode)
+				// Problem: raw string replace can land mid-line and break syntax.
+				// Fix: locate the exact character position of storedSolution,
+				// convert to VS Code positions, snap both ends to full line
+				// boundaries, then replace that clean Range. Never mid-line.
+				const solutionStartIndex = currentText.indexOf(storedSolution!);
+				if (solutionStartIndex === -1) {
+					vscode.window.showInformationMessage('Solution block not found in file.');
+					return;
+				}
+
+				const solutionEndIndex = solutionStartIndex + storedSolution!.length;
+				const rawStartPos = editor.document.positionAt(solutionStartIndex);
+				const rawEndPos = editor.document.positionAt(solutionEndIndex);
+
+				// Snap to line boundaries so insertion is always clean
+				const safeStart = new vscode.Position(rawStartPos.line, 0);
+				const safeEnd = new vscode.Position(
+					rawEndPos.line,
+					editor.document.lineAt(rawEndPos.line).text.length
 				);
+				const safeRange = new vscode.Range(safeStart, safeEnd);
 
 				// Guard: explanation replacement must not start the timer
 				isExtensionEditing = true;
 				await editor.edit(editBuilder => {
-					const fullRange = new vscode.Range(
-						editor.document.positionAt(0),
-						editor.document.positionAt(currentText.length)
-					);
-					editBuilder.replace(fullRange, updatedText);
+					editBuilder.replace(safeRange, explainedCode.trim());
 				});
 				isExtensionEditing = false;
 
@@ -928,21 +1219,8 @@ ${storedSolution}
 
 	// ─────────────────────────────────────────────────────────────
 	// RUN COMMAND
-	// THE FIX IS HERE.
-	//
-	// The previous version did NOT set isExtensionEditing before
-	// calling runActiveFile(). Inside runActiveFile(), the very
-	// first thing that happens is editor.document.save(). That
-	// save() fires onDidChangeTextDocument. If the timer had not
-	// started yet (timerStarted = false) and the file contained
-	// "Question (" the listener would start the timer mid-run.
-	// Then runActiveFile() returned success and stopped it
-	// immediately — this was the race condition causing the timer
-	// to flash on/off and report wrong times.
-	//
-	// Fix: set isExtensionEditing = true before runActiveFile()
-	// so the save-triggered change event is blocked. Reset it
-	// after runActiveFile() resolves so user typing works again.
+	// isExtensionEditing wraps runActiveFile() to block the
+	// save() inside runService from accidentally starting the timer.
 	// ─────────────────────────────────────────────────────────────
 	const runCommand = vscode.commands.registerCommand(
 		'codeforgex.run',
@@ -970,6 +1248,147 @@ ${storedSolution}
 		}
 	);
 
+	// ─────────────────────────────────────────────────────────────
+	// FEATURE 2: EXPLAIN SELECTION
+	// Explains only the currently selected lines of code.
+	// Inserts comment-per-line explanations above each selected line.
+	// Tracked separately from storedExplanation (full-solution explain).
+	// ─────────────────────────────────────────────────────────────
+	const explainSelectionCommand = vscode.commands.registerCommand(
+		'codeforgex.explainSelection',
+		async () => {
+			const editor = vscode.window.activeTextEditor;
+			if (!editor) {
+				vscode.window.showInformationMessage('No active file.');
+				return;
+			}
+
+			const selection = editor.selection;
+			if (selection.isEmpty) {
+				vscode.window.showInformationMessage('No text selected. Please select code first.');
+				return;
+			}
+
+			// ── BUG 1 FIX: Expand selection to full line boundaries ───────
+			// If user selects a partial line (e.g. just "in" from "for char in s:"),
+			// replacing that mid-line token with a multi-line explained block
+			// breaks indentation and splits the line, causing syntax errors.
+			// Fix: always expand to complete lines — from col 0 of the first
+			// selected line to the end of the last selected line.
+			// This means the AI sees and replaces complete lines only.
+			const startLine = selection.start.line;
+			const endLine = selection.end.line;
+			const fullLineRange = new vscode.Range(
+				new vscode.Position(startLine, 0),
+				new vscode.Position(endLine, editor.document.lineAt(endLine).text.length)
+			);
+
+			// Capture the FULL LINES of selected text to send to AI
+			const selectedText = editor.document.getText(fullLineRange);
+			const languageId = editor.document.languageId;
+
+			let explainedBlock: string;
+
+			try {
+				explainedBlock = await vscode.window.withProgress(
+					{
+						location: vscode.ProgressLocation.Notification,
+						title: "Explaining selection...",
+						cancellable: false
+					},
+					async () => {
+						const response = await openai.chat.completions.create({
+							model: "gpt-4o-mini",
+							messages: [
+								{
+									role: "user",
+									content: `You are a coding tutor explaining code to a beginner.
+
+Explain the following ${languageId} code selection line by line.
+
+Rules:
+- Before EACH line of code, add ONE short comment explaining what that line does.
+- Use very simple, clear language. Avoid jargon.
+- Be creative and use different analogies or examples each time.
+- If helpful, add a tiny inline example in the comment.
+- Do NOT remove any original code lines.
+- Do NOT add markdown formatting.
+- Do NOT wrap in triple backticks.
+- Do NOT add decorative borders or separators.
+- Return ONLY the commented + original code. Nothing else.
+
+Code to explain:
+${selectedText}`
+								}
+							],
+							temperature: 0.7
+						});
+
+						return response.choices[0].message.content?.trim() || selectedText;
+					}
+				);
+			} catch {
+				vscode.window.showErrorMessage('Explanation failed. Please try again.');
+				return;
+			}
+
+			// On FIRST explain: save a snapshot of the full file before any changes.
+			// This snapshot is what "Remove Selection Explanation" restores.
+			if (!hasSelectionExplanationFlag) {
+				selectionFileSnapshot = editor.document.getText();
+			}
+
+			// Track this explained block for auto-detection of manual deletion
+			selectionExplainedBlocks.push(explainedBlock);
+			hasSelectionExplanationFlag = true;
+
+			// Replace the full-line range (not the original partial selection)
+			// so the explained block always lands on clean line boundaries
+			isExtensionEditing = true;
+			await editor.edit(editBuilder => {
+				editBuilder.replace(fullLineRange, explainedBlock);
+			});
+			isExtensionEditing = false;
+
+			vscode.window.showInformationMessage('Selection explained. Select more to explain again, or use Remove Selection Explanation to remove all.');
+		}
+	);
+
+	// ─────────────────────────────────────────────────────────────
+	// FEATURE 2: REMOVE SELECTION EXPLANATION
+	// Reverts the explained block back to the original selected code.
+	// ─────────────────────────────────────────────────────────────
+	const removeSelectionExplanationCommand = vscode.commands.registerCommand(
+		'codeforgex.removeSelectionExplanation',
+		async () => {
+			const editor = vscode.window.activeTextEditor;
+			if (!editor || !hasSelectionExplanationFlag || !selectionFileSnapshot) {
+				vscode.window.showInformationMessage('No selection explanation to remove.');
+				return;
+			}
+
+			// Restore the full file snapshot taken before the first explain.
+			// This removes ALL accumulated selection explanations at once,
+			// regardless of how many times the user selected and explained.
+			isExtensionEditing = true;
+			await editor.edit(editBuilder => {
+				const fullRange = new vscode.Range(
+					editor.document.positionAt(0),
+					editor.document.positionAt(editor.document.getText().length)
+				);
+				editBuilder.replace(fullRange, selectionFileSnapshot!);
+			});
+			isExtensionEditing = false;
+
+			// Clear all selection explanation state
+			hasSelectionExplanationFlag = false;
+			selectionExplainedBlocks = [];
+			selectionFileSnapshot = null;
+
+			vscode.window.showInformationMessage('All selection explanations removed.');
+		}
+	);
+
 	context.subscriptions.push(
 		disposable,
 		hintCommand,
@@ -981,7 +1400,9 @@ ${storedSolution}
 		removeExplanationCommand,
 		removeEvaluationCommand,
 		runCommand,
-		timerControlCommand
+		timerControlCommand,
+		explainSelectionCommand,
+		removeSelectionExplanationCommand
 	);
 }
 

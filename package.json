@@ -59,6 +59,14 @@
       {
         "command": "codeforgex.timerControls",
         "title": "Timer Controls"
+      },
+      {
+        "command": "codeforgex.explainSelection",
+        "title": "Explain Selection"
+      },
+      {
+        "command": "codeforgex.removeSelectionExplanation",
+        "title": "Remove Selection Explanation"
       }
     ],
     "menus": {
